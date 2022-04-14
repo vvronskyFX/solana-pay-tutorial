@@ -1,12 +1,18 @@
-import { createTransferCheckedInstruction, getAssociatedTokenAddress, getMint } from "@solana/spl-token"
+import { createTransferCheckedInstruction, getAssociatedTokenAddress, getMint, getOrCreateAssociatedTokenAccount } from "@solana/spl-token"
 import { WalletAdapterNetwork } from "@solana/wallet-adapter-base"
-import { clusterApiUrl, Connection, PublicKey, Transaction } from "@solana/web3.js"
+import { clusterApiUrl, Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js"
 import { NextApiRequest, NextApiResponse } from "next"
-import { shopAddress, usdcAddress } from "../../lib/addresses"
+import { couponAddress, shopAddress, usdcAddress } from "../../lib/addresses"
 import calculatePrice from "../../lib/calculatePrice"
+import base58 from 'bs58'
 
 export type MakeTransactionInputData = {
   account: string,
+}
+
+type MakeTransactionGetResponse = {
+  label: string,
+  icon: string,
 }
 
 export type MakeTransactionOutputData = {
@@ -18,7 +24,14 @@ type ErrorOutput = {
   error: string
 }
 
-export default async function handler(
+function get(res: NextApiResponse<MakeTransactionGetResponse>) {
+  res.status(200).json({
+    label: "Cookies Inc",
+    icon: "https://freesvg.org/img/1370962427.png",
+  })
+}
+
+async function post(
   req: NextApiRequest,
   res: NextApiResponse<MakeTransactionOutputData | ErrorOutput>
 ) {
@@ -43,12 +56,31 @@ export default async function handler(
       res.status(40).json({ error: "No account provided" })
       return
     }
+
+    // We get the shop private key from .env - this is the same as in our script
+    const shopPrivateKey = process.env.SHOP_PRIVATE_KEY as string
+    if (!shopPrivateKey) {
+      res.status(500).json({ error: "Shop private key not available" })
+    }
+    const shopKeypair = Keypair.fromSecretKey(base58.decode(shopPrivateKey))
+
     const buyerPublicKey = new PublicKey(account)
-    const shopPublicKey = shopAddress
+    const shopPublicKey = shopKeypair.publicKey
 
     const network = WalletAdapterNetwork.Devnet
     const endpoint = clusterApiUrl(network)
     const connection = new Connection(endpoint)
+
+    // Get the buyer and seller coupon token accounts
+    // Buyer one may not exist, so we create it (which costs SOL) as the shop account if it doesn't 
+    const buyerCouponAddress = await getOrCreateAssociatedTokenAccount(
+      connection,
+      shopKeypair, // shop pays the fee to create it
+      couponAddress, // which token the account is for
+      buyerPublicKey, // who the token account belongs to (the buyer)
+    ).then(account => account.address)
+
+    const shopCouponAddress = await getAssociatedTokenAddress(couponAddress, shopPublicKey)
 
     // Get details about the USDC token
     const usdcMint = await getMint(connection, usdcAddress)
@@ -72,7 +104,7 @@ export default async function handler(
       usdcAddress, // mint (token address)
       shopUsdcAddress, // destination
       buyerPublicKey, // owner of source address
-      amount.toNumber() * (10 ** (await usdcMint).decimals), // amount to transfer (in units of the USDC token)
+      amount.toNumber() * (10 ** usdcMint.decimals), // amount to transfer (in units of the USDC token)
       usdcMint.decimals, // decimals of the USDC token
     )
 
@@ -84,8 +116,22 @@ export default async function handler(
       isWritable: false,
     })
 
-    // Add the instruction to the transaction
-    transaction.add(transferInstruction)
+    // Create the instruction to send the coupon from the shop to the buyer
+    const couponInstruction = createTransferCheckedInstruction(
+      shopCouponAddress, // source account (coupon)
+      couponAddress, // token address (coupon)
+      buyerCouponAddress, // destination account (coupon)
+      shopPublicKey, // owner of source account
+      1, // amount to transfer
+      0, // decimals of the token - we know this is 0
+    )
+
+    // Add both instructions to the transaction
+    transaction.add(transferInstruction, couponInstruction)
+
+    // Sign the transaction as the shop, which is required to transfer the coupon
+    // We must partial sign because the transfer instruction still requires the user
+    transaction.partialSign(shopKeypair)
 
     // Serialize the transaction and convert to base64 to return it
     const serializedTransaction = transaction.serialize({
@@ -106,5 +152,18 @@ export default async function handler(
 
     res.status(500).json({ error: 'error creating transaction', })
     return
+  }
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<MakeTransactionGetResponse | MakeTransactionOutputData | ErrorOutput>
+) {
+  if (req.method === "GET") {
+    return get(res)
+  } else if (req.method === "POST") {
+    return await post(req, res)
+  } else {
+    return res.status(405).json({ error: "Method not allowed" })
   }
 }
